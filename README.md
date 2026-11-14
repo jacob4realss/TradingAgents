@@ -328,6 +328,35 @@ The CLI takes the same content as a JSON file: `tradingagents --portfolio my_boo
 
 An empty `positions` list means a flat book, which is different from passing nothing. A run without a portfolio is never treated as flat.
 
+## Paper trading on Alpaca
+
+The agents can place their decisions on an [Alpaca](https://alpaca.markets) paper (demo) account, so you can follow how their calls do with pretend money. Only paper accounts are supported: the trading host is fixed to `paper-api.alpaca.markets`, and any other host is refused.
+
+Put your paper account's keys in `.env` (they start with `PK`):
+
+```bash
+APCA_API_KEY_ID=PK...
+APCA_API_SECRET_KEY=...
+```
+
+```bash
+tradingagents alpaca account                 # equity, cash, positions, market hours
+tradingagents alpaca trade NVDA --dry-run    # analyse and show the order, send nothing
+tradingagents alpaca trade NVDA,AAPL         # analyse each, ask before every order
+```
+
+Each run reads the account first, so the trader, risk team and Portfolio Manager work against your actual cash and holdings. The final rating then becomes a whole-share market order, long only:
+
+| Rating | Order |
+|---|---|
+| Buy | raise the position to 10% of equity (`--max-position-pct`) |
+| Overweight | raise it to half that |
+| Hold | none |
+| Underweight | sell half the shares held |
+| Sell | sell every share held; nothing is sold short |
+
+Buys are capped by the cash on hand (never margin) and by `--max-order` (default $25,000). Every order is shown and needs a yes before it is sent; `--yes` skips the question for a scheduled job. An order placed while the market is closed fills after the next open. Each decision and order is appended to `~/.tradingagents/alpaca/orders.jsonl`.
+
 ## Persistence and Recovery
 
 TradingAgents persists two kinds of state across runs.

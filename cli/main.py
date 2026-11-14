@@ -7,7 +7,7 @@ from rich.markup import escape
 
 from cli.display import console
 from cli.models import AnalystType, AssetType
-from cli.prompts import filter_analysts_for_asset_type, parse_analysts
+from cli.prompts import filter_analysts_for_asset_type, parse_analysis_date, parse_analysts
 from cli.run import run_analysis
 from tradingagents.backtest import iter_grid, run_backtest, summarize
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -158,6 +158,117 @@ def backtest(
         console.print(f"[yellow]failed:[/yellow] {ticker} {date}: {reason}")
     for ticker, reason in result.settlement_failures:
         console.print(f"[yellow]unsettled:[/yellow] {ticker}: {reason}")
+
+
+alpaca_app = typer.Typer(help="Trade the agents' decisions on an Alpaca paper (demo) account.")
+app.add_typer(alpaca_app, name="alpaca")
+
+
+def _alpaca_client():
+    from tradingagents.brokers.alpaca import AlpacaClient, AlpacaError
+
+    try:
+        return AlpacaClient()
+    except AlpacaError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from None
+
+
+@alpaca_app.command("account")
+def alpaca_account():
+    """Show the paper account: equity, cash, open positions and market hours."""
+    from tradingagents.brokers.alpaca import AlpacaError
+
+    client = _alpaca_client()
+    try:
+        account, positions, clock = client.account(), client.positions(), client.clock()
+    except AlpacaError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from None
+    console.print(f"Alpaca paper account {escape(str(account.get('account_number', '')))} "
+                  f"({escape(str(account.get('status', '')))})")
+    console.print(f"  Equity        ${float(account['equity']):,.2f}")
+    console.print(f"  Cash          ${float(account['cash']):,.2f}")
+    console.print(f"  Buying power  ${float(account['buying_power']):,.2f}")
+    if positions:
+        console.print("  Positions:")
+        for p in positions:
+            console.print(f"    {p['symbol']:<6} {float(p['qty']):>10g} shares  avg ${float(p['avg_entry_price']):,.2f}"
+                          f"  value ${float(p['market_value']):,.2f}  P/L ${float(p['unrealized_pl']):,.2f}")
+    else:
+        console.print("  Positions: none")
+    state = "open" if clock.get("is_open") else f"closed, next open {clock.get('next_open')}"
+    console.print(f"  Market        {state}")
+
+
+@alpaca_app.command("trade")
+def alpaca_trade(
+    tickers: str = typer.Argument(..., help="Comma-separated US tickers, e.g. NVDA,AAPL"),
+    date: str = typer.Option(None, "--date", help="Analysis date, YYYY-MM-DD (default: today)"),
+    analysts: str = typer.Option(
+        None, "--analysts", help="Comma-separated analysts: market, sentiment, news, fundamentals; omit for all"
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Send each order without asking first"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Analyse and plan the orders, but send none"),
+    max_position_pct: float = typer.Option(
+        10.0, "--max-position-pct", help="Size of a Buy, as a percent of account equity"
+    ),
+    max_order: float = typer.Option(25_000.0, "--max-order", help="Largest single buy, in dollars"),
+    save: bool = typer.Option(True, "--save/--no-save", help="Save each analysis report"),
+):
+    """Analyse each ticker with the agents, then place the order its rating calls for."""
+    import datetime as _dt
+
+    from tradingagents.brokers.alpaca import AlpacaError, SizingRules, trade_ticker
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    try:
+        trade_date = parse_analysis_date(date) if date else _dt.date.today().isoformat()
+        chosen = (parse_analysts(analysts, AssetType.STOCK) if analysts
+                  else filter_analysts_for_asset_type(list(AnalystType), AssetType.STOCK))
+        rules = SizingRules(max_position_pct=max_position_pct / 100, max_order_value=max_order)
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from None
+    names = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    if not names:
+        console.print("[red]No ticker to trade; pass them comma-separated, e.g. NVDA,AAPL[/red]")
+        raise typer.Exit(code=1)
+
+    client = _alpaca_client()
+
+    def confirm(plan) -> bool:
+        if yes:
+            return True
+        if not sys.stdin.isatty():
+            console.print("[yellow]No terminal to ask in; pass --yes to send orders unattended.[/yellow]")
+            return False
+        return typer.confirm(f"Send this order to your Alpaca paper account? {plan.describe()}", default=False)
+
+    def say(line: str) -> None:
+        console.print(escape(line), soft_wrap=True)
+
+    try:
+        graph = TradingAgentsGraph([a.value for a in chosen], config=DEFAULT_CONFIG.copy())
+    except Exception as exc:  # a missing LLM key is a setup error
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from None
+
+    failed = False
+    for name in names:
+        try:
+            outcome = trade_ticker(client, graph, name, trade_date, rules=rules, confirm=confirm,
+                                   dry_run=dry_run, save_reports=save, say=say)
+        except AlpacaError as exc:
+            console.print(f"[red]{name}: {escape(str(exc))}[/red]")
+            failed = True
+            continue
+        if outcome.report_path:
+            console.print(f"[dim]Report: {escape(outcome.report_path)}[/dim]")
+        for error in outcome.errors:
+            console.print(f"[yellow]{escape(error)}[/yellow]")
+    if failed:
+        raise typer.Exit(code=1)
 
 
 # The plans `login` and `logout` take: the providers signed in to, not keyed.
